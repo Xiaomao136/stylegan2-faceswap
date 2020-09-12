@@ -30,29 +30,34 @@ class FaceSwapper:
         self.video_file = video_file
         self.style_image_file = style_image_file
         self.col_styles = col_styles
+        self.network_pkl = network_pkl
 
         # 加载stylegan2人脸模型
-        if network_pkl is None:
+        self._load_network_pkl()
+        # 加载landmark模型
+        # landmarks_model_path = unpack_bz2(get_file('shape_predictor_68_face_landmarks.dat.bz2',
+        #                                           LANDMARKS_MODEL_URL, cache_subdir='temp'))
+        landmarks_model_path = unpack_bz2('model/shape_predictor_68_face_landmarks.dat.bz2')
+        self.landmarks_detector = LandmarksDetector(landmarks_model_path)
+        self.style_latent_vector = None
+
+    # 加载stylegan2人脸模型
+    def _load_network_pkl(self):
+        if self.network_pkl is None:
             self._G = self._D = self.Gs = None
-        elif not network_pkl.startswith('gdrive:'):
-            with open(network_pkl, "rb") as f:
+        elif not self.network_pkl.startswith('gdrive:'):
+            with open(self.network_pkl, "rb") as f:
                 self.pf = f
                 self._G, self._D, self.Gs = pickle.load(f)
         else:
-            self._G, self._D, self.Gs = pretrained_networks.load_networks(network_pkl)
-        # 加载landmark模型
-        landmarks_model_path = unpack_bz2(get_file('shape_predictor_68_face_landmarks.dat.bz2',
-                                                   LANDMARKS_MODEL_URL, cache_subdir='temp'))
-        self.landmarks_detector = LandmarksDetector(landmarks_model_path)
-        self.style_latent_vector = None
+            self._G, self._D, self.Gs = pretrained_networks.load_networks(self.network_pkl)
 
     # 图像对齐（提取脸部，并裁剪成1024*1024的大小）
     def _align_image(self, img):
         # process faces
         for i, face_landmarks in enumerate(self.landmarks_detector.get_landmarks(np.array(img)), start=1):
-            if face_landmarks is None:
-                continue
             return image_align(img, face_landmarks)
+        return None, None
 
     # 图像投影到潜在空间，并获取潜码
     def _project(self, image, dataset_dir, seq_no, style=False):
@@ -87,7 +92,7 @@ class FaceSwapper:
     def _get_style_latent(self, seq_no):
         img = PIL.Image.open(self.style_image_file)
         # 图像对齐
-        aligned_img = self._align_image(img)
+        aligned_img, crop = self._align_image(img)
         # 投影到潜在空间，并获取latent
         return self._project(aligned_img, 'tmp/datasets', seq_no, style=True)
 
@@ -95,9 +100,11 @@ class FaceSwapper:
     def _get_content_latent(self, img, seq_no):
         image = PIL.Image.fromarray(img)
         # 图像对齐
-        aligned_img = self._align_image(image)
+        aligned_img, crop = self._align_image(image)
+        if aligned_img is None or crop is None:
+            return None, None
         # 投影到潜在空间，并获取latent
-        return self._project(aligned_img, 'tmp/datasets', seq_no)
+        return self._project(aligned_img, 'tmp/datasets', seq_no), crop
 
     def _mixing(self, content_latent, style_latent, col_styles):
         z_content = np.stack(content_latent[0] for _ in range(1))
@@ -110,24 +117,102 @@ class FaceSwapper:
         return self._styleMixing(w_content, w_style, col_styles)
 
     # 把风格混合的脸，替换到视频帧图想中
-    def _swap(self, img, mixed_face):
-        video_frame = PIL.Image.fromarray(img)
-        video_frame.save('tmp/video_frame.png')
-        mixed_face.save('tmp/mixed_face.png')
-        return True
+    def _swap(self, img, face_mixed, crop):
+        image = PIL.Image.fromarray(img)
+        mixed = PIL.Image.fromarray(face_mixed)
+        face_resized = mixed.resize((crop[2] - crop[0], crop[3] - crop[1]), PIL.Image.ANTIALIAS)
+        image.paste(face_resized, (crop[0], crop[1]))
+        return np.array(image)
 
     # 给视频文件进行换脸操作
-    def face_swap(self):
+    def face_swap(self, start):
+        if self.Gs is None:
+            print('Gs network is none')
+            exit(1)
+
+        # set noise
+        noise_vars = [var for name, var in self.Gs.components.synthesis.vars.items() if name.startswith('noise')]
+        tflib.set_vars({var: np.random.randn(*var.shape.as_list()) for var in noise_vars})  # [height, width]
+
+        # process style
+        # self.style_latent_vector = self._get_style_latent(0)
+        # np.save(dnnlib.make_run_dir_path('npy/style.npy'), self.style_latent_vector)
+        self.style_latent_vector = np.load('npy/style.npy')
+
+        # process video
+        cap = cv.VideoCapture(self.video_file)
+        seq_no = 0
+        frames = cap.get(cv.CAP_PROP_FRAME_COUNT)
+        fps = cap.get(cv.CAP_PROP_FPS)
+        size = (int(cap.get(cv.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv.CAP_PROP_FRAME_HEIGHT)))
+        splits = self.video_file.split('.')
+        result_video_file = splits[0] + '_result.' + splits[1]
+        fourcc = cv.VideoWriter_fourcc("X", "V", "I", "D")
+        video_writer = cv.VideoWriter(result_video_file, fourcc, fps, size)
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                print("Can't receive frame (stream end?). Exting ...")
+                break
+            if seq_no >= start:
+                img = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
+
+                # 获取latent
+                latent, crop = self._get_content_latent(img, seq_no)
+                if latent is not None and crop is not None:
+                    content_npy_file = 'npy/content_{}.npy'.format(seq_no)
+                    np.save(dnnlib.make_run_dir_path(content_npy_file), latent)
+                    # 风格迁移混合
+                    face_mixed = self._mixing(latent, self.style_latent_vector, self.col_styles)
+                    mixed_file = 'mixed/{}.png'.format(seq_no)
+                    PIL.Image.fromarray(face_mixed).save(mixed_file)
+                    # 换脸
+                    face_swapped = self._swap(img, face_mixed, crop)
+                    swapped_file = 'swapped/{}.png'.format(seq_no)
+                    PIL.Image.fromarray(face_swapped).save(swapped_file)
+                    # write to video
+                    face_bgr = cv.cvtColor(face_swapped, cv.COLOR_RGB2BGR)
+                    video_writer.write(face_bgr)
+                else:
+                    video_writer.write(frame)
+            else:
+                swapped_file = 'swapped/{}.png'.format(seq_no)
+                face_swapped = PIL.Image.open(swapped_file)
+                # write to video
+                face_bgr = cv.cvtColor(np.array(face_swapped), cv.COLOR_RGB2BGR)
+                video_writer.write(face_bgr)
+
+            # increment seq_no
+            seq_no += 1
+            print('process {}/{} ......'.format(seq_no, frames))
+            if seq_no > 100:
+                break
+        video_writer.release()
+
+    # test1
+    def test1(self):
+        if self.Gs is None:
+            print('Gs network is none')
+            exit(1)
+
         # set noise
         noise_vars = [var for name, var in self.Gs.components.synthesis.vars.items() if name.startswith('noise')]
         tflib.set_vars({var: np.random.randn(*var.shape.as_list()) for var in noise_vars})  # [height, width]
         # process style
-        self.style_latent_vector = self._get_style_latent(0)
-        np.save(dnnlib.make_run_dir_path('style.npy'), self.style_latent_vector)
+        self.style_latent_vector = np.load('npy/style.npy')
 
-        # prcess video
+        # process video
         cap = cv.VideoCapture(self.video_file)
         seq_no = 0
+        frames = cap.get(cv.CAP_PROP_FRAME_COUNT)
+        fps = cap.get(cv.CAP_PROP_FPS)
+        size = (int(cap.get(cv.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv.CAP_PROP_FRAME_HEIGHT)))
+        splits = self.video_file.split('.')
+        result_video_file = splits[0] + '_result.' + splits[1]
+        fourcc = cv.VideoWriter_fourcc("X", "V", "I", "D")
+        video_writer = cv.VideoWriter(result_video_file, fourcc, fps, size)
+
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
@@ -136,18 +221,90 @@ class FaceSwapper:
             img = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
 
             # 获取latent
-            latent = self._get_content_latent(img, seq_no)
-            np.save(dnnlib.make_run_dir_path('content_%d.npy' % seq_no, latent))
-            # 风格迁移混合
-            mixed_face = self._mixing(latent, self.style_latent_vector, self.col_styles)
-            # 换脸
-            self._swap(img, mixed_face)
+            latent = np.load('npy/content_0.npy')
+            if latent is not None:
+                content_npy_file = 'npy/content_{}.npy'.format(seq_no)
+                np.save(dnnlib.make_run_dir_path(content_npy_file), latent)
+                # 风格迁移混合
+                face_mixed = self._mixing(latent, self.style_latent_vector, self.col_styles)
+                mixed_file = 'mixed/{}.png'.format(seq_no)
+                PIL.Image.fromarray(face_mixed).save(mixed_file)
+            else:
+                video_writer.write(frame)
             seq_no += 1
+            print('process {}/{} ......'.format(seq_no, frames))
             break
+        video_writer.release()
 
-    # 测试
-    def test(self):
-        style_latent = np.load('results/src1/me_01.npy')
-        content_latent = np.load('results/dst/100-100_01.npy')
-        mixed_face = self.mixing(content_latent, style_latent, [0, 1, 2, 3, 4, 5, 6])
-        mixed_face.show()
+    # 测试图像合并
+    def test2(self):
+        # prcess video
+        cap = cv.VideoCapture(self.video_file)
+        frames = cap.get(cv.CAP_PROP_FRAME_COUNT)
+        fps = cap.get(cv.CAP_PROP_FPS)
+        size = (int(cap.get(cv.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv.CAP_PROP_FRAME_HEIGHT)))
+        splits = self.video_file.split('.')
+        result_video_file = splits[0] + '_result.' + splits[1]
+        fourcc = cv.VideoWriter_fourcc("X", "V", "I", "D")
+        video_writer = cv.VideoWriter(result_video_file, fourcc, fps, size)
+        seq_no = 0
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                print("Can't receive frame (stream end?). Exting ...")
+                break
+            img = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
+            # cv.rotate(img, cv.ROTATE_90_CLOCKWISE)
+            image = PIL.Image.fromarray(img)
+            #image.show()
+            # 图像对齐
+            aligned_img, crop = self._align_image(image)
+            if aligned_img is not None and crop is not None:
+                resize_img = aligned_img.resize((crop[2] - crop[0], crop[3] - crop[1]), PIL.Image.ANTIALIAS)
+                image.paste(resize_img, (crop[0], crop[1]))
+                face_bgr = cv.cvtColor(np.array(image), cv.COLOR_RGB2BGR)
+                video_writer.write(face_bgr)
+            else:
+                video_writer.write(frame)
+            seq_no += 1
+            print('process {}/{} ......'.format(seq_no, frames))
+        video_writer.release()
+
+    def test3(self, start):
+        if self.Gs is None:
+            print('Gs network is none')
+            exit(1)
+
+        # set noise
+        noise_vars = [var for name, var in self.Gs.components.synthesis.vars.items() if name.startswith('noise')]
+        tflib.set_vars({var: np.random.randn(*var.shape.as_list()) for var in noise_vars})  # [height, width]
+
+        # process style
+        # self.style_latent_vector = self._get_style_latent(0)
+        # np.save(dnnlib.make_run_dir_path('npy/style.npy'), self.style_latent_vector)
+        self.style_latent_vector = np.load('npy/style.npy')
+
+        # process video
+        cap = cv.VideoCapture(self.video_file)
+        seq_no = 0
+        frames = cap.get(cv.CAP_PROP_FRAME_COUNT)
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                print("Can't receive frame (stream end?). Exting ...")
+                break
+
+            img = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
+            # 获取latent
+            latent, crop = self._get_content_latent(img, seq_no)
+            if latent is not None and crop is not None:
+                content_npy_file = 'npy/content_{}.npy'.format(seq_no)
+                np.save(dnnlib.make_run_dir_path(content_npy_file), latent)
+                # 风格迁移混合
+                face_mixed = self._mixing(latent, self.style_latent_vector, self.col_styles)
+                mixed_file = 'mixed/{}.png'.format(seq_no)
+                PIL.Image.fromarray(face_mixed).save(mixed_file)
+
+            # increment seq_no
+            seq_no += 1
+            print('process {}/{} ......'.format(seq_no, frames))

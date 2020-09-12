@@ -35,18 +35,21 @@ def main():
     parser.add_argument('--style', help='style file', dest='style_file', required=True)
     parser.add_argument('--col-styles', type=_parse_num_range,
                         help='Style layer range (default: %(default)s)', default='0-6')
+    parser.add_argument('--start', type=int, help='start from', dest='start_from', default=0)
     args = parser.parse_args()
 
     network_pkl = args.network_pkl
     video_file = args.video_file
     style_file = args.style_file
     col_styles = args.col_styles
+    start_from = args.start_from
     if network_pkl == 'None':
         network_pkl = None
 
     tflib.init_tf()
     swapper = FaceSwapper(network_pkl, video_file, style_file, col_styles)
-    swapper.face_swap()
+    # swapper.face_swap(start_from)
+    swapper.test2()
 
 
 if __name__ == "__main__":

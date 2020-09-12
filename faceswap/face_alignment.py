@@ -127,12 +127,14 @@ def image_align(img, face_landmarks, output_size=1024, transform_size=4096, enab
         quad /= shrink
         qsize /= shrink
 
+    crop_ret = None
     # Crop.
     border = max(int(np.rint(qsize * 0.1)), 3)
     crop = (int(np.floor(min(quad[:, 0]))), int(np.floor(min(quad[:, 1]))), int(np.ceil(max(quad[:, 0]))),
             int(np.ceil(max(quad[:, 1]))))
     crop = (max(crop[0] - border, 0), max(crop[1] - border, 0), min(crop[2] + border, img.size[0]),
             min(crop[3] + border, img.size[1]))
+    crop_ret = crop
     if crop[2] - crop[0] < img.size[0] or crop[3] - crop[1] < img.size[1]:
         img = img.crop(crop)
         quad -= crop[0:2]
@@ -159,6 +161,5 @@ def image_align(img, face_landmarks, output_size=1024, transform_size=4096, enab
     img = img.transform((transform_size, transform_size), PIL.Image.QUAD, (quad + 0.5).flatten(), PIL.Image.BILINEAR)
     if output_size < transform_size:
         img = img.resize((output_size, output_size), PIL.Image.ANTIALIAS)
-
-    return img
+    return img, crop_ret
 

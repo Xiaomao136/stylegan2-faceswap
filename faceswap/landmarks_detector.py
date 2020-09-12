@@ -1,6 +1,6 @@
 import dlib
-
-
+import PIL
+import cv2
 class LandmarksDetector:
     def __init__(self, predictor_model_path):
         """
@@ -10,8 +10,8 @@ class LandmarksDetector:
         self.shape_predictor = dlib.shape_predictor(predictor_model_path)
 
     def get_landmarks(self, img):
-        dets = self.detector(img, 1)
-        for detection in dets:
+        det_rets = self.detector(img, 1)
+        for detection in det_rets:
             face_landmarks = [(item.x, item.y) for item in self.shape_predictor(img, detection).parts()]
             yield face_landmarks
 
